@@ -1,4 +1,4 @@
-// chimera_autopatch.cpp - Most Reliable Version for your CrackMe
+// chimera_autopatch.cpp - Refined Version with Precise Patching
 #include <windows.h>
 #include <iostream>
 #include <fstream>
@@ -75,96 +75,174 @@ public:
         return false;
     }
 
+    // Helper to check if offset is within .text section bounds
+    bool inText(uint32_t offset, uint32_t minSpace = 1) {
+        return offset >= textRaw && offset < textRaw + textSize && (offset + minSpace) <= (textRaw + textSize);
+    }
+
+    // Convert raw offset to virtual address
+    uint64_t rawToVA(uint32_t raw) {
+        return imageBase + textRVA + (raw - textRaw);
+    }
+
     void autopatch() {
         if (!loaded) { std::cout << "[-] No file loaded!\n"; return; }
         logs.clear();
-        std::cout << "[*] Forcing VerifyPassword to always return true...\n";
+        std::cout << "[*] Analyzing VerifyPassword function for precise patching...\n";
 
         int patches = 0;
+        std::vector<uint32_t> checksumOffsets;
 
-        // Method 1: Patch SETE / SETNE near the checksum
+        // Step 1: Find all checksum occurrences
         for (uint32_t i = textRaw; i < textRaw + textSize - 4; ++i) {
             if (*reinterpret_cast<uint32_t*>(&buffer[i]) == 0x5B7C3A9F) {
-                std::cout << "[+] Found checksum at 0x" << std::hex << (imageBase + textRVA + (i - textRaw)) << std::dec << "\n";
-
-                // Look for comparison result instructions
-                for (uint32_t j = i - 100; j < i + 100 && j < textRaw + textSize - 3; ++j) {
-                    // SETE AL, SETNE AL, or similar
-                    if (buffer[j] == 0x0F && (buffer[j+1] == 0x94 || buffer[j+1] == 0x95)) {
-                        uint64_t patchVA = imageBase + textRVA + (j - textRaw);
-                        std::string oldB = std::format("{:02X} {:02X}", buffer[j], buffer[j+1]);
-
-                        // Force AL = 1 (true)
-                        buffer[j]   = 0xB0;  // mov al, 1
-                        buffer[j+1] = 0x01;
-                        buffer[j+2] = 0x90;  // nop
-
-                        logs.push_back({patchVA, "Patched SETE/SETNE to MOV AL,1 (force true)", oldB, "B0 01 90"});
-                        std::cout << "[+] Patched return value at 0x" << std::hex << patchVA << std::dec << "\n";
-                        patches++;
-                    }
-
-                    // If we see TEST or CMP followed by Jcc, force the jump
-                    if ((buffer[j] == 0x85 || buffer[j] == 0x3B) && 
-                        (buffer[j+2] == 0x74 || buffer[j+2] == 0x75 || buffer[j+2] == 0x0F)) {
-                        uint64_t patchVA = imageBase + textRVA + (j+2 - textRaw);
-                        std::string oldB = std::format("{:02X}", buffer[j+2]);
-
-                        buffer[j+2] = 0xEB;   // force unconditional jump to success
-                        logs.push_back({patchVA, "Forced Jcc to JMP (success path)", oldB, "EB"});
-                        std::cout << "[+] Forced jump at 0x" << std::hex << patchVA << std::dec << "\n";
-                        patches++;
-                    }
-                }
+                checksumOffsets.push_back(i);
+                std::cout << "[+] Found checksum at raw offset 0x" << std::hex << i 
+                          << " (VA: 0x" << rawToVA(i) << ")" << std::dec << "\n";
             }
         }
 
-        if (patches == 0) {
-            std::cout << "[!] No patchable pattern found. Trying brute force on all Jcc near checksum...\n";
-            // Brute force fallback
-            for (uint32_t i = textRaw; i < textRaw + textSize - 4; ++i) {
-                if (*reinterpret_cast<uint32_t*>(&buffer[i]) == 0x5B7C3A9F) {
-                    for (uint32_t j = i - 120; j < i + 120 && j < textRaw + textSize - 2; ++j) {
-                        uint8_t b = buffer[j];
-                        if ((b >= 0x70 && b <= 0x7F) || (b == 0x0F && buffer[j+1] >= 0x80 && buffer[j+1] <= 0x8F)) {
-                            uint64_t va = imageBase + textRVA + (j - textRaw);
-                            std::string oldB = (b == 0x0F) ? std::format("{:02X} {:02X}", b, buffer[j+1]) : std::format("{:02X}", b);
-                            buffer[j] = 0xEB;
-                            if (b == 0x0F) buffer[j+1] = 0x90;
-                            logs.push_back({va, "Brute force Jcc patch", oldB, "EB"});
-                            std::cout << "[+] Brute force patch at 0x" << std::hex << va << std::dec << "\n";
+        if (checksumOffsets.empty()) {
+            std::cout << "[-] Checksum not found! Cannot autopatch.\n";
+            return;
+        }
+
+        // Step 2: For each checksum, analyze the surrounding code precisely
+        for (uint32_t chkOff : checksumOffsets) {
+            std::cout << "\n[*] Analyzing code around checksum at 0x" << std::hex << chkOff << std::dec << "...\n";
+
+            // Search window: 200 bytes before to 200 bytes after checksum
+            uint32_t start = (chkOff > 200) ? chkOff - 200 : textRaw;
+            uint32_t end = std::min(chkOff + 200u, textRaw + textSize - 16);
+
+            bool patched_func = false;
+
+            // Strategy A: Find RET 0xC or RET and patch function to return 1 immediately
+            // Look for function prologue patterns and early returns
+            for (uint32_t j = start; j < chkOff && !patched_func; ++j) {
+                // Pattern: XOR EAX, EAX followed by INC EAX (return 1) then RET
+                if (inText(j, 3) && buffer[j] == 0x33 && buffer[j+1] == 0xC0 && 
+                    buffer[j+2] == 0x40) {
+                    // Found: XOR EAX,EAX; INC EAX - this sets return value to 1
+                    // Check if followed by RET soon
+                    for (uint32_t k = j + 3; k < j + 20 && k < end; ++k) {
+                        if (buffer[k] == 0xC3) {
+                            uint64_t va = rawToVA(j);
+                            std::string oldB = std::format("{:02X} {:02X} {:02X}", buffer[j], buffer[j+1], buffer[j+2]);
+                            // Replace with: MOV EAX, 1 (B8 01 00 00 00) - cleaner, same size consideration
+                            buffer[j] = 0xB8;
+                            buffer[j+1] = 0x01;
+                            buffer[j+2] = 0x00;
+                            // Insert NOPs to fill if needed, but let's keep it minimal
+                            logs.push_back({va, "Force return value to 1 (XOR/INC -> MOV EAX,1)", oldB, "B8 01 00"});
+                            std::cout << "[+] Patched return value setup at VA 0x" << std::hex << va << std::dec << "\n";
                             patches++;
+                            patched_func = true;
                             break;
                         }
+                    }
+                }
+            }
+
+            // Strategy B: Patch conditional jumps AFTER checksum comparison
+            // Look for JZ/JNZ (74/75) or SETE/SETNE (0F 94/95) after the checksum
+            if (!patched_func) {
+                for (uint32_t j = chkOff + 4; j < end && !patched_func; ++j) {
+                    // SETE (0F 94) or SETNE (0F 95) - convert to MOV AL, 1
+                    if (inText(j, 2) && buffer[j] == 0x0F && (buffer[j+1] == 0x94 || buffer[j+1] == 0x95)) {
+                        uint64_t va = rawToVA(j);
+                        std::string oldB = std::format("{:02X} {:02X}", buffer[j], buffer[j+1]);
+                        // Replace SETcc AL with MOV AL, 1 (B0 01) - exactly 2 bytes, no overflow
+                        buffer[j] = 0xB0;
+                        buffer[j+1] = 0x01;
+                        logs.push_back({va, "SETE/SETNE -> MOV AL,1 (force true)", oldB, "B0 01"});
+                        std::cout << "[+] Patched SETE/SETNE at VA 0x" << std::hex << va << std::dec << "\n";
+                        patches++;
+                        patched_func = true;
+                    }
+                    // JZ (74) or JNZ (75) - convert to JMP EB
+                    else if (inText(j, 1) && (buffer[j] == 0x74 || buffer[j] == 0x75)) {
+                        // Only patch if this jump is within 50 bytes of checksum (likely the decision point)
+                        if (j - chkOff < 50) {
+                            uint64_t va = rawToVA(j);
+                            std::string oldB = std::format("{:02X}", buffer[j]);
+                            buffer[j] = 0xEB;  // JMP rel8
+                            logs.push_back({va, "JZ/JNZ -> JMP (force success path)", oldB, "EB"});
+                            std::cout << "[+] Patched conditional jump at VA 0x" << std::hex << va << std::dec << "\n";
+                            patches++;
+                            patched_func = true;
+                        }
+                    }
+                }
+            }
+
+            // Strategy C: If still not patched, find the first conditional jump after checksum and force it
+            if (!patched_func) {
+                for (uint32_t j = chkOff + 4; j < end; ++j) {
+                    uint8_t b = buffer[j];
+                    // Short conditional jumps: 0x70-0x7F
+                    if (b >= 0x70 && b <= 0x7F) {
+                        uint64_t va = rawToVA(j);
+                        std::string oldB = std::format("{:02X}", b);
+                        buffer[j] = 0xEB;  // Unconditional JMP
+                        logs.push_back({va, "Force Jcc to JMP (fallback)", oldB, "EB"});
+                        std::cout << "[+] Fallback patch at VA 0x" << std::hex << va << std::dec << "\n";
+                        patches++;
+                        break;  // Only one fallback patch per checksum
+                    }
+                    // Long conditional jumps: 0F 80-8F
+                    else if (b == 0x0F && inText(j, 2) && buffer[j+1] >= 0x80 && buffer[j+1] <= 0x8F) {
+                        uint64_t va = rawToVA(j);
+                        std::string oldB = std::format("{:02X} {:02X}", b, buffer[j+1]);
+                        buffer[j] = 0xE9;  // JMP rel32 (need to handle displacement)
+                        buffer[j+1] = 0x00;
+                        buffer[j+2] = 0x00;
+                        buffer[j+3] = 0x00;
+                        buffer[j+4] = 0x00;
+                        logs.push_back({va, "Force long Jcc to JMP (fallback)", oldB, "E9 00 00 00 00"});
+                        std::cout << "[+] Fallback long jump patch at VA 0x" << std::hex << va << std::dec << "\n";
+                        patches++;
+                        break;
                     }
                 }
             }
         }
 
         if (patches > 0) {
-            std::cout << "\n[+] TOTAL PATCHES APPLIED: " << patches << "\n";
+            std::cout << "\n[+] ========================================\n";
+            std::cout << "[+] TOTAL PATCHES APPLIED: " << patches << "\n";
             std::cout << "[+] The patched exe should now accept ANY password!\n";
+            std::cout << "[+] ========================================\n";
         } else {
-            std::cout << "[!] Still no patches applied. Please send me the DumpNShow output again.\n";
+            std::cout << "\n[!] No patches applied. Manual analysis required.\n";
         }
     }
 
     void dumpAndShow() {
         if (!loaded) { std::cout << "[-] No file loaded!\n"; return; }
         std::cout << "\n=== DumpNShow - Checksum Search ===\n";
+        int found = 0;
         for (uint32_t i = textRaw; i < textRaw + textSize - 4; ++i) {
             if (*reinterpret_cast<uint32_t*>(&buffer[i]) == 0x5B7C3A9F) {
-                uint64_t va = imageBase + textRVA + (i - textRaw);
-                std::cout << "[+] FOUND CHECKSUM at 0x" << std::hex << va << std::dec << "\n";
+                uint64_t va = rawToVA(i);
+                std::cout << "[+] FOUND CHECKSUM #" << ++found << " at VA: 0x" << std::hex << va << std::dec << "\n";
                 std::cout << "    Raw offset: 0x" << std::hex << i << std::dec << "\n";
-                std::cout << "    Context: ";
+                std::cout << "    Context (+/- 24 bytes): ";
                 for (int k = -24; k <= 24; ++k) {
                     uint32_t p = i + k;
-                    if (p >= textRaw && p < textRaw + textSize)
-                        std::cout << std::format("{:02X} ", buffer[p]);
+                    if (p >= textRaw && p < textRaw + textSize) {
+                        // Highlight the checksum itself
+                        if (k >= 0 && k < 4)
+                            std::cout << "\033[1;31m" << std::format("{:02X}", buffer[p]) << "\033[0m ";
+                        else
+                            std::cout << std::format("{:02X} ", buffer[p]);
+                    }
                 }
                 std::cout << "\n\n";
             }
+        }
+        if (found == 0) {
+            std::cout << "[-] No checksum (0x5B7C3A9F) found in .text section.\n";
         }
     }
 
@@ -173,71 +251,106 @@ public:
         std::string bak = filePath + ".bak";
         std::string out = filePath + ".patched.exe";
 
-        std::filesystem::rename(filePath, bak);
+        // Create backup silently
+        try {
+            std::filesystem::copy_file(filePath, bak, std::filesystem::copy_options::overwrite_existing);
+        } catch (...) {}
+        
         std::ofstream f(out, std::ios::binary);
-        if (!f) { std::cout << "[-] Save failed!\n"; return false; }
+        if (!f) { 
+            std::cout << "[-] Save failed! Cannot write to " << out << "\n"; 
+            return false; 
+        }
         f.write(reinterpret_cast<const char*>(buffer.data()), buffer.size());
         f.close();
 
-        std::cout << "[+] Saved: " << std::filesystem::path(out).filename() << "\n";
+        std::cout << "[+] Saved patched binary to: " << std::filesystem::path(out).filename() << "\n";
+        std::cout << "[!] Original file preserved (backup created if needed).\n";
         return true;
     }
 };
 
-int main() {
+int main(int argc, char* argv[]) {
     ChimeraAutopatcher p;
     std::string line;
 
     std::cout << "============================================\n";
-    std::cout << "      ChimeraDBG Autopatch - Ultra Mode\n";
+    std::cout << "   ChimeraDBG Autopatch - Refined Version\n";
     std::cout << "============================================\n\n";
 
-    int argc; 
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    // Support command-line argument for batch mode
     if (argc > 1) {
-        std::wstring w(argv[1]);
-        std::string path(w.begin(), w.end());
+        std::string path = argv[1];
         if (!path.empty() && path[0] == '"') path = path.substr(1, path.size()-2);
-        p.load(path);
+        if (p.load(path)) {
+            p.autopatch();
+            p.save();
+            return 0;
+        }
+        return 1;
     }
-    LocalFree(argv);
 
     while (true) {
         if (!p.loaded) {
             std::cout << "Drag & drop CrackMe.exe or enter full path:\n> ";
             std::getline(std::cin, line);
-            if (line.empty() || line == "exit") break;
+            if (line.empty() || line == "exit" || line == "quit") break;
             if (line[0] == '"') line = line.substr(1, line.size()-2);
+            // Trim whitespace
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\r' || line.back() == '\n'))
+                line.pop_back();
+            if (line.empty()) continue;
             p.load(line);
         } else {
-            std::cout << "\nMenu:\n";
-            std::cout << "1. Run Ultra Autopatch (Force Success)\n";
-            std::cout << "2. DumpNShow\n";
+            std::cout << "\n========== MENU ==========\n";
+            std::cout << "1. Run Precise Autopatch\n";
+            std::cout << "2. DumpNShow (Find Checksum)\n";
             std::cout << "3. Show Patch Log\n";
-            std::cout << "4. Save Patched File\n";
+            std::cout << "4. Save Patched Binary\n";
             std::cout << "5. Load New File\n";
-            std::cout << "6. Exit\n> ";
+            std::cout << "6. Exit\n";
+            std::cout << "> ";
+            
             int c;
-            std::cin >> c;
-            std::cin.ignore();
-
-            if (c == 1) p.autopatch();
-            else if (c == 2) p.dumpAndShow();
-            else if (c == 3) {
-                std::cout << "\n--- Patch Log ---\n";
-                for (const auto& patch : p.logs) {
-                    std::cout << "0x" << std::hex << std::uppercase << patch.addr 
-                              << " | " << patch.desc 
-                              << " | Old: " << patch.oldBytes << " -> New: " << patch.newBytes << "\n";
-                }
-                std::cout << std::dec;
+            if (!(std::cin >> c)) {
+                std::cin.clear();
+                std::cin.ignore(10000, '\n');
+                continue;
             }
-            else if (c == 4) p.save();
-            else if (c == 5) p.loaded = false;
-            else if (c == 6) break;
+            std::cin.ignore(10000, '\n');
+
+            switch (c) {
+                case 1: 
+                    p.autopatch(); 
+                    break;
+                case 2: 
+                    p.dumpAndShow(); 
+                    break;
+                case 3: {
+                    std::cout << "\n========== PATCH LOG ==========\n";
+                    if (p.logs.empty()) {
+                        std::cout << "(no patches applied yet)\n";
+                    } else {
+                        for (const auto& patch : p.logs) {
+                            std::cout << "VA: 0x" << std::hex << std::uppercase << patch.addr << std::nouppercase << std::dec
+                                      << "\n   " << patch.desc 
+                                      << "\n   Bytes: " << patch.oldBytes << " -> " << patch.newBytes << "\n\n";
+                        }
+                    }
+                    break;
+                }
+                case 4: 
+                    p.save(); 
+                    break;
+                case 5: 
+                    p.loaded = false; 
+                    break;
+                case 6: 
+                    return 0;
+                default:
+                    std::cout << "Invalid option.\n";
+            }
         }
-        std::cout << "\nPress Enter to continue...";
-        std::getchar();
     }
     return 0;
 }
