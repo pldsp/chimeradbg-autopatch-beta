@@ -7,7 +7,8 @@
 #include <iomanip>
 #include <filesystem>
 #include <algorithm>
-#include <format>
+#include <cstdio>
+#include <sstream>
 
 struct Patch {
     uint64_t addr;
@@ -128,7 +129,9 @@ public:
                     for (uint32_t k = j + 3; k < j + 20 && k < end; ++k) {
                         if (buffer[k] == 0xC3) {
                             uint64_t va = rawToVA(j);
-                            std::string oldB = std::format("{:02X} {:02X} {:02X}", buffer[j], buffer[j+1], buffer[j+2]);
+                            char buf[64];
+                            snprintf(buf, sizeof(buf), "%02X %02X %02X", buffer[j], buffer[j+1], buffer[j+2]);
+                            std::string oldB = buf;
                             // Replace with: MOV EAX, 1 (B8 01 00 00 00) - cleaner, same size consideration
                             buffer[j] = 0xB8;
                             buffer[j+1] = 0x01;
@@ -151,7 +154,9 @@ public:
                     // SETE (0F 94) or SETNE (0F 95) - convert to MOV AL, 1
                     if (inText(j, 2) && buffer[j] == 0x0F && (buffer[j+1] == 0x94 || buffer[j+1] == 0x95)) {
                         uint64_t va = rawToVA(j);
-                        std::string oldB = std::format("{:02X} {:02X}", buffer[j], buffer[j+1]);
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%02X %02X", buffer[j], buffer[j+1]);
+                        std::string oldB = buf;
                         // Replace SETcc AL with MOV AL, 1 (B0 01) - exactly 2 bytes, no overflow
                         buffer[j] = 0xB0;
                         buffer[j+1] = 0x01;
@@ -165,7 +170,9 @@ public:
                         // Only patch if this jump is within 50 bytes of checksum (likely the decision point)
                         if (j - chkOff < 50) {
                             uint64_t va = rawToVA(j);
-                            std::string oldB = std::format("{:02X}", buffer[j]);
+                            char buf[16];
+                            snprintf(buf, sizeof(buf), "%02X", buffer[j]);
+                            std::string oldB = buf;
                             buffer[j] = 0xEB;  // JMP rel8
                             logs.push_back({va, "JZ/JNZ -> JMP (force success path)", oldB, "EB"});
                             std::cout << "[+] Patched conditional jump at VA 0x" << std::hex << va << std::dec << "\n";
@@ -183,7 +190,9 @@ public:
                     // Short conditional jumps: 0x70-0x7F
                     if (b >= 0x70 && b <= 0x7F) {
                         uint64_t va = rawToVA(j);
-                        std::string oldB = std::format("{:02X}", b);
+                        char buf[16];
+                        snprintf(buf, sizeof(buf), "%02X", b);
+                        std::string oldB = buf;
                         buffer[j] = 0xEB;  // Unconditional JMP
                         logs.push_back({va, "Force Jcc to JMP (fallback)", oldB, "EB"});
                         std::cout << "[+] Fallback patch at VA 0x" << std::hex << va << std::dec << "\n";
@@ -193,7 +202,9 @@ public:
                     // Long conditional jumps: 0F 80-8F
                     else if (b == 0x0F && inText(j, 2) && buffer[j+1] >= 0x80 && buffer[j+1] <= 0x8F) {
                         uint64_t va = rawToVA(j);
-                        std::string oldB = std::format("{:02X} {:02X}", b, buffer[j+1]);
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%02X %02X", b, buffer[j+1]);
+                        std::string oldB = buf;
                         buffer[j] = 0xE9;  // JMP rel32 (need to handle displacement)
                         buffer[j+1] = 0x00;
                         buffer[j+2] = 0x00;
@@ -232,10 +243,15 @@ public:
                     uint32_t p = i + k;
                     if (p >= textRaw && p < textRaw + textSize) {
                         // Highlight the checksum itself
-                        if (k >= 0 && k < 4)
-                            std::cout << "\033[1;31m" << std::format("{:02X}", buffer[p]) << "\033[0m ";
-                        else
-                            std::cout << std::format("{:02X} ", buffer[p]);
+                        if (k >= 0 && k < 4) {
+                            char buf[8];
+                            snprintf(buf, sizeof(buf), "%02X", buffer[p]);
+                            std::cout << "\033[1;31m" << buf << "\033[0m ";
+                        } else {
+                            char buf[8];
+                            snprintf(buf, sizeof(buf), "%02X", buffer[p]);
+                            std::cout << buf << " ";
+                        }
                     }
                 }
                 std::cout << "\n\n";
